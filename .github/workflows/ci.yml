@@ -1,0 +1,46 @@
+name: Rust Continuous Integration
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-lint:
+    name: Integración Continua (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Clonar el repositorio
+      uses: actions/checkout@v4
+
+    - name: Configurar el Toolchain de Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+
+    - name: Configurar Cache para Cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: 1. Validar compilación (Fast Check)
+      run: cargo check --verbose
+
+    - name: 2. Verificar formato del código (Rustfmt)
+      run: cargo fmt --check
+
+    - name: 3. Análisis estático y buenas prácticas (Clippy)
+      run: cargo clippy -- -D warnings
