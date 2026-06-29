@@ -144,51 +144,54 @@ async fn main() -> io::Result<()> {
             match async_fd_rx.readable().await {
                 Err(_) => break,
                 Ok(mut guard) => {
-                    // FIX 3: recv_safe convierte &mut Vec<u8> → &mut [MaybeUninit<u8>]
-                    match recv_safe(guard.get_inner(), &mut buffer) {
-                        Ok(bytes_leidos) if bytes_leidos >= 40 => {
-                            let ihl = (buffer[0] & 0x0F) as usize * 4;
-                            let tcp_start = ihl;
+                    // Bucle interno para vaciar todo lo que el kernel ya recibió
+                    loop {
+                        match recv_safe(guard.get_inner(), &mut buffer) {
+                            Ok(bytes_leidos) if bytes_leidos >= 40 => {
+                                let ihl = (buffer[0] & 0x0F) as usize * 4;
+                                let tcp_start = ihl;
 
-                            if bytes_leidos < tcp_start + 20 {
-                                guard.clear_ready();
-                                continue;
-                            }
+                                if bytes_leidos < tcp_start + 20 {
+                                    continue;
+                                }
 
-                            let ip_src =
-                                Ipv4Addr::new(buffer[12], buffer[13], buffer[14], buffer[15]);
-                            let p_src =
-                                u16::from_be_bytes([buffer[tcp_start], buffer[tcp_start + 1]]);
-                            let p_dst_recibido =
-                                u16::from_be_bytes([buffer[tcp_start + 2], buffer[tcp_start + 3]]);
-                            let ack_recibido = u32::from_be_bytes([
-                                buffer[tcp_start + 8],
-                                buffer[tcp_start + 9],
-                                buffer[tcp_start + 10],
-                                buffer[tcp_start + 11],
-                            ]);
-                            let flags = buffer[tcp_start + 13];
+                                let ip_src =
+                                    Ipv4Addr::new(buffer[12], buffer[13], buffer[14], buffer[15]);
+                                let p_src =
+                                    u16::from_be_bytes([buffer[tcp_start], buffer[tcp_start + 1]]);
+                                let p_dst_recibido = u16::from_be_bytes([
+                                    buffer[tcp_start + 2],
+                                    buffer[tcp_start + 3],
+                                ]);
+                                let ack_recibido = u32::from_be_bytes([
+                                    buffer[tcp_start + 8],
+                                    buffer[tcp_start + 9],
+                                    buffer[tcp_start + 10],
+                                    buffer[tcp_start + 11],
+                                ]);
+                                let flags = buffer[tcp_start + 13];
 
-                            if p_dst_recibido == p_origen
-                                && verificar_token(ip_src, p_src, ack_recibido)
-                            {
-                                if flags & 0x12 == 0x12 {
-                                    abiertos += 1;
-                                    println!("[+] ¡ABIERTO!  -> {}:{}", ip_src, p_src);
-                                } else if flags & 0x04 == 0x04 {
-                                    cerrados += 1;
-                                    println!("[-] Cerrado    -> {}:{}", ip_src, p_src);
+                                if p_dst_recibido == p_origen
+                                    && verificar_token(ip_src, p_src, ack_recibido)
+                                {
+                                    if flags & 0x12 == 0x12 {
+                                        abiertos += 1;
+                                        println!("[+] ¡ABIERTO!  -> {}:{}", ip_src, p_src);
+                                    } else if flags & 0x04 == 0x04 {
+                                        cerrados += 1;
+                                        println!("[-] Cerrado    -> {}:{}", ip_src, p_src);
+                                    }
                                 }
                             }
-                            guard.clear_ready();
+                            Ok(_) => {} // Paquete inválido/ruido, sigue leyendo el búfer
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                // El búfer del kernel quedó verdaderamente vacío.
+                                // AQUÍ es seguro limpiar el estado y esperar al próximo evento de red.
+                                guard.clear_ready();
+                                break;
+                            }
+                            Err(_) => return (abiertos, cerrados),
                         }
-                        Ok(_) => {
-                            guard.clear_ready();
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            guard.clear_ready();
-                        }
-                        Err(_) => break,
                     }
                 }
             }
@@ -292,7 +295,7 @@ async fn main() -> io::Result<()> {
 
             tokio::time::sleep(tokio::time::Duration::from_micros(200)).await;
 
-            if paquetes_enviados > 0 && paquetes_enviados % 20 == 0 {
+            if paquetes_enviados > 0 && paquetes_enviados.is_multiple_of(20) {
                 tokio::task::yield_now().await;
             }
         }
