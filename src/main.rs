@@ -6,10 +6,6 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 
-// =============================================================================
-// ESTRUCTURAS DE CABECERA
-// =============================================================================
-
 #[derive(Debug)]
 struct IpHeader {
     ver_ihl: u8,
@@ -36,20 +32,18 @@ struct TcpHeader {
     puntero_urgente: u16,
 }
 
-// =============================================================================
-// HELPER: Ipv4Addr → u32 en network byte order
-// =============================================================================
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EstadoPuerto {
+    Abierto,
+    Cerrado,
+}
+
 #[inline]
 fn ipv4_a_u32(ip: Ipv4Addr) -> u32 {
     let o = ip.octets();
     ((o[0] as u32) << 24) | ((o[1] as u32) << 16) | ((o[2] as u32) << 8) | (o[3] as u32)
 }
 
-// =============================================================================
-// FÓRMULA STATELESS
-// TX: seq = (ip_u32 XOR puerto_rotado) + SALT
-// RX: ack_recibido == seq + 1
-// =============================================================================
 const SALT: u32 = 0xDEAD_C0DE;
 
 #[inline]
@@ -64,9 +58,6 @@ fn verificar_token(ip_src: Ipv4Addr, p_src: u16, ack_recibido: u32) -> bool {
     ack_recibido == codificar_seq(ip_src, p_src).wrapping_add(1)
 }
 
-// =============================================================================
-// FIX 2: set_ip_hdrincl no existe en socket2 0.5 — activar via setsockopt libc
-// =============================================================================
 fn activar_ip_hdrincl(socket: &Socket) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let fd = socket.as_raw_fd();
@@ -87,239 +78,261 @@ fn activar_ip_hdrincl(socket: &Socket) -> io::Result<()> {
     }
 }
 
-// =============================================================================
-// FIX 3: recv() en socket2 0.5 requiere &mut [MaybeUninit<u8>]
-// Este helper convierte el Vec<u8> al tipo correcto y extrae los bytes seguros.
-// =============================================================================
 fn recv_safe(socket: &Socket, buf: &mut Vec<u8>) -> io::Result<usize> {
-    // SAFETY: MaybeUninit<u8> tiene el mismo layout que u8.
-    // socket2::recv() inicializa exactamente `n` bytes, que luego leemos.
     let uninit_buf = unsafe { &mut *(buf.as_mut_slice() as *mut [u8] as *mut [MaybeUninit<u8>]) };
     socket.recv(uninit_buf)
 }
 
+fn crear_socket_raw_tcp() -> io::Result<Socket> {
+    match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP)) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            eprintln!("❌ Requiere privilegios de Root. Ejecuta con: sudo cargo run");
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn construir_paquete_syn(
+    ip_origen: Ipv4Addr,
+    ip_destino: Ipv4Addr,
+    p_origen: u16,
+    puerto_dest: u16,
+    id_ip: u16,
+) -> io::Result<Vec<u8>> {
+    let seq_stateless = codificar_seq(ip_destino, puerto_dest);
+
+    let tcp = TcpHeader {
+        puerto_origen: p_origen,
+        puerto_destino: puerto_dest,
+        num_secuencia: seq_stateless,
+        num_ack: 0,
+        offset_res_flags: 0x5002,
+        ventana: 1024,
+        checksum: 0,
+        puntero_urgente: 0,
+    };
+    let mut tcp_bytes = de_tcp_a_bytes(&tcp);
+    let tcp_csum = calcular_tcp_checksum(&ip_origen, &ip_destino, &tcp_bytes);
+    tcp_bytes[16] = (tcp_csum >> 8) as u8;
+    tcp_bytes[17] = (tcp_csum & 0xFF) as u8;
+
+    let ip = IpHeader {
+        ver_ihl: 0x45,
+        tos: 0,
+        longitud_total: 40,
+        id: id_ip,
+        flags_fragmento: 0x4000,
+        ttl: 64,
+        protocolo: 6,
+        checksum: 0,
+        origen: ip_origen.octets(),
+        destino: ip_destino.octets(),
+    };
+    let mut ip_bytes = de_ip_a_bytes(&ip);
+    let ip_csum = calcular_ip_checksum(&ip_bytes);
+    ip_bytes[10] = (ip_csum >> 8) as u8;
+    ip_bytes[11] = (ip_csum & 0xFF) as u8;
+
+    let mut paquete = Vec::with_capacity(40);
+    paquete.extend_from_slice(&ip_bytes);
+    paquete.extend_from_slice(&tcp_bytes);
+
+    if paquete.len() != 40 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Error de serialización: se esperaban 40 bytes, se obtuvieron {}",
+                paquete.len()
+            ),
+        ));
+    }
+
+    Ok(paquete)
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    println!("=== ESCÁNER SYN STATELESS MASIVO: PRODUCCIÓN (FASE 4) ===");
+    println!("=== ESCÁNER SYN STATELESS MASIVO: PRODUCCIÓN (FASE 5) ===");
 
-    let ip_origen = Ipv4Addr::new(192, 168, 0, 3);
+    let ip_origen: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 3);
     let subred_base = "192.168.0";
     let puertos_objetivo: Vec<u16> = vec![80, 8080, 443];
     let p_origen: u16 = 54321;
 
-    let socket_tx = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP)) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            eprintln!("❌ Requiere privilegios de Root (sudo cargo run).");
-            return Err(e);
-        }
-        Err(e) => return Err(e),
-    };
-    // FIX 2: reemplaza socket_tx.set_ip_hdrincl(true) que no existe en socket2 0.5
+    let socket_tx = crear_socket_raw_tcp()?;
     activar_ip_hdrincl(&socket_tx)?;
     socket_tx.set_nonblocking(true)?;
     let async_fd_tx = Arc::new(AsyncFd::new(socket_tx)?);
 
-    let socket_rx = match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP)) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            eprintln!("❌ Requiere privilegios de Root (sudo cargo run).");
-            return Err(e);
-        }
-        Err(e) => return Err(e),
-    };
+    let socket_rx = crear_socket_raw_tcp()?;
     socket_rx.set_nonblocking(true)?;
     let async_fd_rx = Arc::new(AsyncFd::new(socket_rx)?);
 
-    // =========================================================================
-    // 2. SNIFFER RECEPTOR (tarea de fondo)
-    // =========================================================================
     let sniffer = tokio::spawn(async move {
         let mut buffer = vec![0u8; 4096];
-        let mut abiertos: u32 = 0;
-        let mut cerrados: u32 = 0;
+        let mut resultados: Vec<(Ipv4Addr, u16, EstadoPuerto)> = Vec::new();
         println!("[*] Sniffer activo escuchando respuestas TCP...");
 
         loop {
-            match async_fd_rx.readable().await {
+            let mut guard = match async_fd_rx.readable().await {
+                Ok(g) => g,
                 Err(_) => break,
-                Ok(mut guard) => {
-                    // Bucle interno para vaciar todo lo que el kernel ya recibió
-                    loop {
-                        match recv_safe(guard.get_inner(), &mut buffer) {
-                            Ok(bytes_leidos) if bytes_leidos >= 40 => {
-                                let ihl = (buffer[0] & 0x0F) as usize * 4;
-                                let tcp_start = ihl;
+            };
 
-                                if bytes_leidos < tcp_start + 20 {
-                                    continue;
-                                }
+            match recv_safe(guard.get_inner(), &mut buffer) {
+                Ok(bytes_leidos) if bytes_leidos >= 40 => {
+                    let ihl = (buffer[0] & 0x0F) as usize * 4;
+                    let tcp_start = ihl;
 
-                                let ip_src =
-                                    Ipv4Addr::new(buffer[12], buffer[13], buffer[14], buffer[15]);
-                                let p_src =
-                                    u16::from_be_bytes([buffer[tcp_start], buffer[tcp_start + 1]]);
-                                let p_dst_recibido = u16::from_be_bytes([
-                                    buffer[tcp_start + 2],
-                                    buffer[tcp_start + 3],
-                                ]);
-                                let ack_recibido = u32::from_be_bytes([
-                                    buffer[tcp_start + 8],
-                                    buffer[tcp_start + 9],
-                                    buffer[tcp_start + 10],
-                                    buffer[tcp_start + 11],
-                                ]);
-                                let flags = buffer[tcp_start + 13];
-
-                                if p_dst_recibido == p_origen
-                                    && verificar_token(ip_src, p_src, ack_recibido)
-                                {
-                                    if flags & 0x12 == 0x12 {
-                                        abiertos += 1;
-                                        println!("[+] ¡ABIERTO!  -> {}:{}", ip_src, p_src);
-                                    } else if flags & 0x04 == 0x04 {
-                                        cerrados += 1;
-                                        println!("[-] Cerrado    -> {}:{}", ip_src, p_src);
-                                    }
-                                }
-                            }
-                            Ok(_) => {} // Paquete inválido/ruido, sigue leyendo el búfer
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                // El búfer del kernel quedó verdaderamente vacío.
-                                // AQUÍ es seguro limpiar el estado y esperar al próximo evento de red.
-                                guard.clear_ready();
-                                break;
-                            }
-                            Err(_) => return (abiertos, cerrados),
-                        }
+                    if bytes_leidos < tcp_start + 20 {
+                        guard.clear_ready();
+                        continue;
                     }
-                }
-            }
-        }
 
-        (abiertos, cerrados)
-    });
+                    let ip_src = Ipv4Addr::new(buffer[12], buffer[13], buffer[14], buffer[15]);
+                    let p_src = u16::from_be_bytes([buffer[tcp_start], buffer[tcp_start + 1]]);
+                    let p_dst_recibido =
+                        u16::from_be_bytes([buffer[tcp_start + 2], buffer[tcp_start + 3]]);
+                    let ack_recibido = u32::from_be_bytes([
+                        buffer[tcp_start + 8],
+                        buffer[tcp_start + 9],
+                        buffer[tcp_start + 10],
+                        buffer[tcp_start + 11],
+                    ]);
+                    let flags = buffer[tcp_start + 13];
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
-
-    // =========================================================================
-    // 3. INYECTOR GENERATIVO (TX loop)
-    // =========================================================================
-    println!(
-        "[*] Iniciando inyección masiva sobre el segmento {}.1-254...",
-        subred_base
-    );
-    let mut rng = rand::thread_rng();
-    let mut paquetes_enviados: u32 = 0;
-
-    for host in 1u8..=254 {
-        let ip_dest_str = format!("{}.{}", subred_base, host);
-        let ip_destino: Ipv4Addr = ip_dest_str.parse().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("IP inválida '{}': {}", ip_dest_str, e),
-            )
-        })?;
-
-        if ip_destino == ip_origen {
-            continue;
-        }
-
-        for &puerto_dest in &puertos_objetivo {
-            let seq_stateless = codificar_seq(ip_destino, puerto_dest);
-            // FIX 1: `gen` es palabra reservada en Rust >= 1.75 (edición 2024)
-            // rng.r#gen() es la forma de escaparla, o usar gen_range / random
-            let id_aleatorio: u16 = rng.r#gen();
-
-            // Cabecera TCP
-            let tcp = TcpHeader {
-                puerto_origen: p_origen,
-                puerto_destino: puerto_dest,
-                num_secuencia: seq_stateless,
-                num_ack: 0,
-                offset_res_flags: 0x5002,
-                ventana: 1024,
-                checksum: 0,
-                puntero_urgente: 0,
-            };
-            let mut tcp_bytes = de_tcp_a_bytes(&tcp);
-            let tcp_csum = calcular_tcp_checksum(&ip_origen, &ip_destino, &tcp_bytes);
-            tcp_bytes[16] = (tcp_csum >> 8) as u8;
-            tcp_bytes[17] = (tcp_csum & 0xFF) as u8;
-
-            // Cabecera IP
-            let ip = IpHeader {
-                ver_ihl: 0x45,
-                tos: 0,
-                longitud_total: 40,
-                id: id_aleatorio,
-                flags_fragmento: 0x4000,
-                ttl: 64,
-                protocolo: 6,
-                checksum: 0,
-                origen: ip_origen.octets(),
-                destino: ip_destino.octets(),
-            };
-            let mut ip_bytes = de_ip_a_bytes(&ip);
-            let ip_csum = calcular_ip_checksum(&ip_bytes);
-            ip_bytes[10] = (ip_csum >> 8) as u8;
-            ip_bytes[11] = (ip_csum & 0xFF) as u8;
-
-            let mut paquete = Vec::with_capacity(40);
-            paquete.extend_from_slice(&ip_bytes);
-            paquete.extend_from_slice(&tcp_bytes);
-
-            let sock_addr = SockAddr::from(std::net::SocketAddr::new(
-                std::net::IpAddr::V4(ip_destino),
-                puerto_dest,
-            ));
-
-            match async_fd_tx.writable().await {
-                Ok(mut guard) => {
-                    match guard.get_inner().send_to(&paquete, &sock_addr) {
-                        Ok(_) => {
-                            paquetes_enviados += 1;
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(e) => {
-                            eprintln!(
-                                "[!] Error inyectando a {}:{} → {}",
-                                ip_destino, puerto_dest, e
-                            );
+                    if p_dst_recibido == p_origen && verificar_token(ip_src, p_src, ack_recibido) {
+                        if flags & 0x12 == 0x12 {
+                            println!("[+] ¡ABIERTO!  -> {}:{}", ip_src, p_src);
+                            resultados.push((ip_src, p_src, EstadoPuerto::Abierto));
+                        } else if flags & 0x04 == 0x04 {
+                            println!("[-] Cerrado    -> {}:{}", ip_src, p_src);
+                            resultados.push((ip_src, p_src, EstadoPuerto::Cerrado));
                         }
                     }
                     guard.clear_ready();
                 }
-                Err(e) => eprintln!("[!] Error esperando socket TX: {}", e),
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_micros(200)).await;
-
-            if paquetes_enviados > 0 && paquetes_enviados.is_multiple_of(20) {
-                tokio::task::yield_now().await;
+                Ok(_) => {
+                    guard.clear_ready();
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    guard.clear_ready();
+                }
+                Err(_) => break,
             }
         }
-    }
 
-    println!(
-        "✔ Inyección completada: {} paquetes SYN enviados. Esperando respuestas residuales...",
-        paquetes_enviados
-    );
+        resultados
+    });
 
-    // =========================================================================
-    // 4. VENTANA DE CAPTURA FINAL + RESUMEN
-    // =========================================================================
+    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+
+    let async_fd_tx_loop = Arc::clone(&async_fd_tx);
+    let tx_loop = async move {
+        let mut rng = rand::thread_rng();
+        let mut paquetes_enviados: u32 = 0;
+        let mut errores: u32 = 0;
+
+        for host in 1u8..=254 {
+            let ip_dest_str = format!("{}.{}", subred_base, host);
+
+            let ip_destino: Ipv4Addr = match ip_dest_str.parse() {
+                Ok(ip) => ip,
+                Err(e) => {
+                    eprintln!("[!] IP inválida '{}': {} — host omitido", ip_dest_str, e);
+                    errores += 1;
+                    continue;
+                }
+            };
+
+            if ip_destino == ip_origen {
+                continue;
+            }
+
+            for &puerto_dest in &puertos_objetivo {
+                let id_aleatorio: u16 = rng.r#gen();
+
+                let paquete = match construir_paquete_syn(
+                    ip_origen,
+                    ip_destino,
+                    p_origen,
+                    puerto_dest,
+                    id_aleatorio,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "[!] Error construyendo paquete para {}:{} → {}",
+                            ip_destino, puerto_dest, e
+                        );
+                        errores += 1;
+                        continue;
+                    }
+                };
+
+                let sock_addr = SockAddr::from(std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(ip_destino),
+                    puerto_dest,
+                ));
+
+                match async_fd_tx_loop.writable().await {
+                    Ok(mut guard) => {
+                        match guard.get_inner().send_to(&paquete, &sock_addr) {
+                            Ok(_) => paquetes_enviados += 1,
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(e) => {
+                                eprintln!(
+                                    "[!] Error inyectando a {}:{} → {}",
+                                    ip_destino, puerto_dest, e
+                                );
+                                errores += 1;
+                            }
+                        }
+                        guard.clear_ready();
+                    }
+                    Err(e) => {
+                        eprintln!("[!] Error esperando socket TX: {}", e);
+                        errores += 1;
+                    }
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_micros(50)).await;
+
+                if paquetes_enviados > 0 && paquetes_enviados % 10 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        (paquetes_enviados, errores)
+    };
+
     tokio::select! {
-        _ = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {
+        (paquetes, errores) = tx_loop => {
+            println!(
+                "✔ Inyección completada: {} paquetes enviados, {} errores. Esperando respuestas residuales...",
+                paquetes, errores
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             println!("\n[*] Ventana de captura cerrada.");
         }
         result = sniffer => {
             match result {
-                Ok((abiertos, cerrados)) => {
-                    println!("\n[*] Sniffer terminó. Abiertos: {} | Cerrados: {}", abiertos, cerrados);
+                Ok(resultados) => {
+                    let abiertos = resultados.iter().filter(|(_, _, e)| *e == EstadoPuerto::Abierto).count();
+                    let cerrados = resultados.iter().filter(|(_, _, e)| *e == EstadoPuerto::Cerrado).count();
+                    println!(
+                        "\n[*] Sniffer terminó antes que el TX. Abiertos: {} | Cerrados: {}",
+                        abiertos, cerrados
+                    );
                 }
                 Err(e) => eprintln!("❌ Falla crítica en Sniffer: {:?}", e),
             }
+        }
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
+            eprintln!("\n[!] Timeout global de 30s alcanzado — escaneo cortado por seguridad.");
         }
     }
 
@@ -371,6 +384,7 @@ fn calcular_ip_checksum(ip_bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// Checksum TCP con pseudo-header IPv4 (RFC 793)
 fn calcular_tcp_checksum(origen: &Ipv4Addr, destino: &Ipv4Addr, tcp_bytes: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let oct_orig = origen.octets();
