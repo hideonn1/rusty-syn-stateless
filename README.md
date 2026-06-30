@@ -27,6 +27,10 @@ RX: Verificar si (ACK_Recibido - 1) == (IP_Origen ^ Puerto_Origen_Rotado_16) + S
 ```
 Esto garantiza la ausencia de falsos positivos causados por colisiones lineales sin degradar el rendimiento del procesamiento de la tarjeta de red.
 
+> [!NOTE]
+> El escáner SYN funciona sólo en Linux por ahora, en el futuro se implementará y habrá mayores pruebas de compatibilidad
+> con sistemas operativos Windows. 
+
 ## 📦 Requisitos Previos
 Dado que la herramienta inyecta y manipula cabeceras IP y TCP personalizadas desde cero, el kernel del sistema operativo requiere privilegios administrativos para inicializar un socket en modo RAW.
 
