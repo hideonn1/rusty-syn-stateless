@@ -1,3 +1,4 @@
+use clap::Parser;
 use rand::Rng;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
@@ -5,6 +6,54 @@ use std::mem::MaybeUninit;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
+
+#[derive(Parser, Debug)]
+#[command(name = "lab_seguridad")]
+#[command(about = "Escáner SYN stateless de Capa 3/4 — uso en redes propias", long_about = None)]
+struct Cli {
+    #[arg(long, default_value = "192.168.0")]
+    subred: String,
+
+    #[arg(long, default_value = "192.168.0.3")]
+    ip_origen: String,
+
+    #[arg(long, default_value = "80,443,8080", value_delimiter = ',')]
+    puertos: Vec<u16>,
+
+    #[arg(long, default_value_t = 54321)]
+    puerto_origen: u16,
+
+    #[arg(long, default_value_t = 30)]
+    timeout_secs: u64,
+
+    #[arg(long, default_value_t = 3)]
+    ventana_captura_secs: u64,
+
+    #[arg(short, long, conflicts_with = "quiet")]
+    verbose: bool,
+
+    #[arg(short, long, conflicts_with = "verbose")]
+    quiet: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verbosidad {
+    Silencioso,
+    Normal,
+    Detallado,
+}
+
+impl Verbosidad {
+    fn desde_flags(verbose: bool, quiet: bool) -> Self {
+        if verbose {
+            Verbosidad::Detallado
+        } else if quiet {
+            Verbosidad::Silencioso
+        } else {
+            Verbosidad::Normal
+        }
+    }
+}
 
 #[derive(Debug)]
 struct IpHeader {
@@ -87,7 +136,7 @@ fn crear_socket_raw_tcp() -> io::Result<Socket> {
     match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP)) {
         Ok(s) => Ok(s),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            eprintln!("❌ Requiere privilegios de Root. Ejecuta con: sudo cargo run");
+            eprintln!("❌ Requiere privilegios de Root. Ejecuta con: sudo cargo run -- [args]");
             Err(e)
         }
         Err(e) => Err(e),
@@ -154,12 +203,27 @@ fn construir_paquete_syn(
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    println!("=== ESCÁNER SYN STATELESS MASIVO: PRODUCCIÓN (FASE 5) ===");
+    let cli = Cli::parse();
+    let verbosidad = Verbosidad::desde_flags(cli.verbose, cli.quiet);
 
-    let ip_origen: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 3);
-    let subred_base = "192.168.0";
-    let puertos_objetivo: Vec<u16> = vec![80, 8080, 443];
-    let p_origen: u16 = 54321;
+    let ip_origen: Ipv4Addr = cli.ip_origen.parse().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--ip-origen '{}' no es una IP válida: {}", cli.ip_origen, e),
+        )
+    })?;
+
+    if verbosidad != Verbosidad::Silencioso {
+        println!("=== ESCÁNER SYN STATELESS MASIVO: PRODUCCIÓN (FASE 6) ===");
+        println!(
+            "[*] Subred: {}.1-254 | Puertos: {:?} | Origen: {}:{}",
+            cli.subred, cli.puertos, ip_origen, cli.puerto_origen
+        );
+    }
+
+    let subred_base = cli.subred.clone();
+    let puertos_objetivo = cli.puertos.clone();
+    let p_origen = cli.puerto_origen;
 
     let socket_tx = crear_socket_raw_tcp()?;
     activar_ip_hdrincl(&socket_tx)?;
@@ -173,7 +237,10 @@ async fn main() -> io::Result<()> {
     let sniffer = tokio::spawn(async move {
         let mut buffer = vec![0u8; 4096];
         let mut resultados: Vec<(Ipv4Addr, u16, EstadoPuerto)> = Vec::new();
-        println!("[*] Sniffer activo escuchando respuestas TCP...");
+
+        if verbosidad != Verbosidad::Silencioso {
+            println!("[*] Sniffer activo escuchando respuestas TCP...");
+        }
 
         loop {
             let mut guard = match async_fd_rx.readable().await {
@@ -203,12 +270,23 @@ async fn main() -> io::Result<()> {
                     ]);
                     let flags = buffer[tcp_start + 13];
 
+                    if verbosidad == Verbosidad::Detallado {
+                        println!(
+                            "[v] RX crudo: {}:{} -> puerto_dst={} ack={:#010x} flags={:#04x}",
+                            ip_src, p_src, p_dst_recibido, ack_recibido, flags
+                        );
+                    }
+
                     if p_dst_recibido == p_origen && verificar_token(ip_src, p_src, ack_recibido) {
                         if flags & 0x12 == 0x12 {
-                            println!("[+] ¡ABIERTO!  -> {}:{}", ip_src, p_src);
+                            if verbosidad != Verbosidad::Silencioso {
+                                println!("[+] ¡ABIERTO!  -> {}:{}", ip_src, p_src);
+                            }
                             resultados.push((ip_src, p_src, EstadoPuerto::Abierto));
                         } else if flags & 0x04 == 0x04 {
-                            println!("[-] Cerrado    -> {}:{}", ip_src, p_src);
+                            if verbosidad == Verbosidad::Detallado {
+                                println!("[-] Cerrado    -> {}:{}", ip_src, p_src);
+                            }
                             resultados.push((ip_src, p_src, EstadoPuerto::Cerrado));
                         }
                     }
@@ -229,6 +307,13 @@ async fn main() -> io::Result<()> {
 
     tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
 
+    if verbosidad != Verbosidad::Silencioso {
+        println!(
+            "[*] Iniciando inyección masiva sobre el segmento {}.1-254...",
+            subred_base
+        );
+    }
+
     let async_fd_tx_loop = Arc::clone(&async_fd_tx);
     let tx_loop = async move {
         let mut rng = rand::thread_rng();
@@ -241,7 +326,9 @@ async fn main() -> io::Result<()> {
             let ip_destino: Ipv4Addr = match ip_dest_str.parse() {
                 Ok(ip) => ip,
                 Err(e) => {
-                    eprintln!("[!] IP inválida '{}': {} — host omitido", ip_dest_str, e);
+                    if verbosidad == Verbosidad::Detallado {
+                        eprintln!("[!] IP inválida '{}': {} — host omitido", ip_dest_str, e);
+                    }
                     errores += 1;
                     continue;
                 }
@@ -272,6 +359,15 @@ async fn main() -> io::Result<()> {
                     }
                 };
 
+                if verbosidad == Verbosidad::Detallado {
+                    println!(
+                        "[v] TX -> {}:{} (seq={:#010x})",
+                        ip_destino,
+                        puerto_dest,
+                        codificar_seq(ip_destino, puerto_dest)
+                    );
+                }
+
                 let sock_addr = SockAddr::from(std::net::SocketAddr::new(
                     std::net::IpAddr::V4(ip_destino),
                     puerto_dest,
@@ -300,7 +396,7 @@ async fn main() -> io::Result<()> {
 
                 tokio::time::sleep(tokio::time::Duration::from_micros(50)).await;
 
-                if paquetes_enviados > 0 && paquetes_enviados.is_multiple_of(10) {
+                if paquetes_enviados > 0 && paquetes_enviados % 10 == 0 {
                     tokio::task::yield_now().await;
                 }
             }
@@ -309,14 +405,21 @@ async fn main() -> io::Result<()> {
         (paquetes_enviados, errores)
     };
 
+    let timeout_secs = cli.timeout_secs;
+    let ventana_secs = cli.ventana_captura_secs;
+
     tokio::select! {
         (paquetes, errores) = tx_loop => {
-            println!(
-                "✔ Inyección completada: {} paquetes enviados, {} errores. Esperando respuestas residuales...",
-                paquetes, errores
-            );
-            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            println!("\n[*] Ventana de captura cerrada.");
+            if verbosidad != Verbosidad::Silencioso {
+                println!(
+                    "✔ Inyección completada: {} paquetes enviados, {} errores. Esperando respuestas residuales ({}s)...",
+                    paquetes, errores, ventana_secs
+                );
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(ventana_secs)).await;
+            if verbosidad != Verbosidad::Silencioso {
+                println!("\n[*] Ventana de captura cerrada.");
+            }
         }
         result = sniffer => {
             match result {
@@ -331,12 +434,14 @@ async fn main() -> io::Result<()> {
                 Err(e) => eprintln!("❌ Falla crítica en Sniffer: {:?}", e),
             }
         }
-        _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
-            eprintln!("\n[!] Timeout global de 30s alcanzado — escaneo cortado por seguridad.");
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(timeout_secs)) => {
+            eprintln!("\n[!] Timeout global de {}s alcanzado — escaneo cortado por seguridad.", timeout_secs);
         }
     }
 
-    println!("[*] Escaneo completado. Sockets liberados.");
+    if verbosidad != Verbosidad::Silencioso {
+        println!("[*] Escaneo completado. Sockets liberados.");
+    }
     Ok(())
 }
 
@@ -384,7 +489,6 @@ fn calcular_ip_checksum(ip_bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// Checksum TCP con pseudo-header IPv4 (RFC 793)
 fn calcular_tcp_checksum(origen: &Ipv4Addr, destino: &Ipv4Addr, tcp_bytes: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let oct_orig = origen.octets();
