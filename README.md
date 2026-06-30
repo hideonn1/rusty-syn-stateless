@@ -1,5 +1,9 @@
 # Escáner SYN Masivo y Stateless en Rust
 
+<p align="center">
+    <img src="./assets/captura-1.png" alt="Captura de pantalla de Rustysn ejecutándose en términal de Linux" width="900">
+</p>
+
 Un motor de exploración de red local asíncrono y de alto rendimiento escrito en **Rust** utilizando **Tokio** y sockets crudos (`RAW`). El diseño está optimizado para realizar barridos rápidos en segmentos de red local sin necesidad de almacenar el estado de las conexiones en memoria de espacio de usuario.
 
 ## 🚀 Características Principales
