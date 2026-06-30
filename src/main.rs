@@ -747,7 +747,7 @@ async fn ejecutar_escaner(args: EscanerArgs) -> io::Result<()> {
 
                 tokio::time::sleep(tokio::time::Duration::from_micros(50)).await;
 
-                if paquetes_enviados > 0 && paquetes_enviados % 10 == 0 {
+                if paquetes_enviados > 0 && paquetes_enviados.is_multiple_of(10) {
                     tokio::task::yield_now().await;
                 }
             }
