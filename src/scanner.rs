@@ -40,10 +40,7 @@ fn recv_safe(socket: &Socket, buf: &mut Vec<u8>) -> io::Result<usize> {
 }
 
 fn crear_socket_raw_tcp() -> io::Result<Socket> {
-    match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP)) {
-        Ok(s) => Ok(s),
-        Err(e) => Err(e),
-    }
+    Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP))
 }
 
 fn construir_paquete_syn(
