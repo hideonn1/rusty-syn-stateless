@@ -176,7 +176,7 @@ pub async fn ejecutar_monitor(args: MonitorArgs) -> io::Result<()> {
 
         conocidas = actuales;
         primera_pasada = false;
-        
+
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(args.intervalo_secs)) => {}
             _ = tokio::signal::ctrl_c() => {

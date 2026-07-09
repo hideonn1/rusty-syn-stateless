@@ -55,8 +55,7 @@ fn detectar_ip_local() -> io::Result<Ipv4Addr> {
     socket.connect("8.8.8.8:80")?;
     match socket.local_addr()?.ip() {
         std::net::IpAddr::V4(ip) => Ok(ip),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Other,
+        _ => Err(io::Error::other(
             "No se pudo detectar una dirección IPv4 local",
         )),
     }
