@@ -9,7 +9,7 @@ Un motor de exploración de red local asíncrono y de alto rendimiento escrito e
 ## 🚀 Características Principales
 
 * **Arquitectura Stateless:** No almacena tablas de conexiones ni mapas en memoria. Utiliza una fórmula matemática asimétrica basada en operaciones de rotación de bits de puertos, máscaras XOR y una constante criptográfica (`SALT`) para codificar el identificador único del host objetivo dentro del número de secuencia (`SEQ`) del paquete TCP SYN saliente.
-* **Safe Rust Nativo:** Eliminación completa de bloques `unsafe` o manipulación cruda de punteros en espacio de usuario. Toda la captura y parsing de buffers se realiza de forma nativa a través de la API segura de `socket2`.
+* **Uso Mínimo de Unsafe:** Los bloques `unsafe` se limitan estrictamente a la interfaz con el kernel (`setsockopt` para `IP_HDRINCL`) y la conversión de buffers para `socket2`. Toda la lógica de parsing de paquetes y checksums se implementa en Safe Rust nativo.
 * **Asincronía No Bloqueante:** Concurrencia real implementada mediante `tokio::io::unix::AsyncFd`, permitiendo el procesamiento simultáneo del loop inyector y el sniffer receptor sobre descriptores de archivos asíncronos del sistema operativo.
 * **Mitigación de Inanición (Starvation Control):** Uso táctico de `tokio::task::yield_now()` y control estricto de eventos de lectura de búfer (`WouldBlock`) para evitar *spin-locks* y deadlocks asíncronos en entornos de ejecución con alta densidad de tráfico local.
 

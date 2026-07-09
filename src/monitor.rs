@@ -1,15 +1,39 @@
 use crate::cli::{MonitorArgs, Verbosidad};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::Ipv4Addr;
 use tokio::fs;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct Conexion {
     pub ip_local: Ipv4Addr,
     pub puerto_local: u16,
     pub ip_remota: Ipv4Addr,
     pub puerto_remoto: u16,
     pub estado: String,
+}
+
+// Hash y Eq basados solo en la 4-tupla de conexión, excluyendo el estado.
+// Esto evita reportar un cambio de estado (e.g. SYN_SENT → ESTABLISHED)
+// como una conexión cerrada + nueva.
+impl PartialEq for Conexion {
+    fn eq(&self, other: &Self) -> bool {
+        self.ip_local == other.ip_local
+            && self.puerto_local == other.puerto_local
+            && self.ip_remota == other.ip_remota
+            && self.puerto_remoto == other.puerto_remoto
+    }
+}
+
+impl Eq for Conexion {}
+
+impl Hash for Conexion {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.ip_local.hash(state);
+        self.puerto_local.hash(state);
+        self.ip_remota.hash(state);
+        self.puerto_remoto.hash(state);
+    }
 }
 
 fn parsear_direccion_proc(campo: &str) -> Option<(Ipv4Addr, u16)> {
@@ -27,7 +51,7 @@ fn parsear_direccion_proc(campo: &str) -> Option<(Ipv4Addr, u16)> {
 }
 
 fn estado_desde_codigo(codigo: &str) -> String {
-    match codigo {
+    match codigo.to_ascii_uppercase().as_str() {
         "01" => "ESTABLISHED",
         "02" => "SYN_SENT",
         "03" => "SYN_RECV",
@@ -105,8 +129,13 @@ pub async fn ejecutar_monitor(args: MonitorArgs) -> io::Result<()> {
             // CORRECCIÓN: .await
             Ok(c) => c,
             Err(_) => {
-                tokio::time::sleep(tokio::time::Duration::from_secs(args.intervalo_secs)).await;
-                continue;
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(args.intervalo_secs)) => continue,
+                    _ = tokio::signal::ctrl_c() => {
+                        println!("\nSaliendo del monitor (Ctrl+C)...");
+                        break;
+                    }
+                }
             }
         };
 
@@ -147,7 +176,14 @@ pub async fn ejecutar_monitor(args: MonitorArgs) -> io::Result<()> {
 
         conocidas = actuales;
         primera_pasada = false;
-        tokio::time::sleep(tokio::time::Duration::from_secs(args.intervalo_secs)).await;
+        
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(args.intervalo_secs)) => {}
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nSaliendo del monitor (Ctrl+C)...");
+                break;
+            }
+        }
     }
     Ok(())
 }
