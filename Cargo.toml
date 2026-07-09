@@ -1,6 +1,6 @@
 [package]
 name = "rustysn"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 authors = ["Pedro Lorca Astroza <lorcapedro883@gmail.com>"]
 description = "Escáner SYN y monitor de conexiones para redes."
