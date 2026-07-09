@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::Ipv4Addr;
 
 #[derive(Debug)]
@@ -34,9 +36,11 @@ pub fn ipv4_a_u32(ip: Ipv4Addr) -> u32 {
 
 #[inline]
 pub fn codificar_seq(ip: Ipv4Addr, puerto: u16, salt: u32) -> u32 {
-    let ip_u32 = ipv4_a_u32(ip);
-    let puerto_rotado = (puerto as u32).rotate_left(16);
-    (ip_u32 ^ puerto_rotado).wrapping_add(salt)
+    let mut hasher = DefaultHasher::new();
+    salt.hash(&mut hasher);
+    ipv4_a_u32(ip).hash(&mut hasher);
+    puerto.hash(&mut hasher);
+    hasher.finish() as u32
 }
 
 #[inline]

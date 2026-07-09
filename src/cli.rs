@@ -51,8 +51,9 @@ pub enum Modo {
 pub struct EscanerArgs {
     #[arg(long, default_value = "192.168.0")]
     pub subred: String,
-    #[arg(long, default_value = "192.168.0.3")]
-    pub ip_origen: String,
+    /// IP de origen para los paquetes SYN. Si se omite, se detecta automáticamente.
+    #[arg(long)]
+    pub ip_origen: Option<String>,
     #[arg(long, default_value = "80,443,8080", value_delimiter = ',')]
     pub puertos: Vec<u16>,
     #[arg(long, default_value_t = 54321)]
